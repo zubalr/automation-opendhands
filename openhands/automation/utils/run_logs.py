@@ -1,12 +1,6 @@
-"""Bounded snapshot of a run's outer bash command output.
+"""Bounded bash stdout/stderr snapshot onto AutomationRun.
 
-Live ``bash_events`` remain the streaming source while a run is RUNNING.
-Once the command has a non-null ``exit_code``, we copy a bounded
-stdout/stderr snapshot onto ``AutomationRun`` so later prune/clear of
-bash events cannot erase pass/fail or the run-logs UI.
-
-This module only copies event bodies. It never deletes agent-server files.
-Snapshot contents must not be logged (they may contain secrets).
+Copy only. Never delete agent-server files. Never log snapshot bodies.
 """
 
 from __future__ import annotations
@@ -37,9 +31,9 @@ _MAX_PAGES = 200
 
 @dataclass(frozen=True)
 class RunLogSnapshot:
-    """Durable copy of a finished outer-bash command's result."""
+    """Bounded copy of outer-bash streams and exit_code."""
 
-    exit_code: int
+    exit_code: int | None
     stdout: str
     stderr: str
     logs_truncated: bool
@@ -59,9 +53,8 @@ def bound_streams(
     stderr: str,
     cap_bytes: int = SNAPSHOT_STREAM_CAP_BYTES,
 ) -> tuple[str, str, bool]:
-    """Cap each stream independently, preferring the tail of stderr (and stdout)."""
+    """Cap each stream independently, tail-preferring."""
     stdout, out_cut = _utf8_tail(stdout, cap_bytes)
-    # Tail-prefer stderr so the actual failure is kept when the stream is huge.
     stderr, err_cut = _utf8_tail(stderr, cap_bytes)
     return stdout, stderr, out_cut or err_cut
 
@@ -78,11 +71,12 @@ def snapshot_from_bash_outputs(
     *,
     truncated_by_pagination: bool = False,
     cap_bytes: int = SNAPSHOT_STREAM_CAP_BYTES,
+    require_exit_code: bool = True,
 ) -> RunLogSnapshot | None:
     """Concat BashOutput chunks in timestamp order and bound each stream.
 
-    Returns None unless some event has a non-null ``exit_code``. The last
-    non-null exit code wins. Does not mutate ``events``.
+    Last non-null exit_code wins. Default: None until an exit_code exists.
+    ``require_exit_code=False`` keeps streams while bash is still running.
     """
     if not events:
         return None
@@ -95,10 +89,14 @@ def snapshot_from_bash_outputs(
         stdout_parts.append(event.get("stdout") or "")
         stderr_parts.append(event.get("stderr") or "")
         event_exit = event.get("exit_code")
-        if event_exit is not None:
-            exit_code = event_exit
+        if event_exit is None:
+            continue
+        try:
+            exit_code = int(event_exit)
+        except (TypeError, ValueError):
+            continue
 
-    if exit_code is None:
+    if exit_code is None and require_exit_code:
         return None
 
     stdout, stderr, truncated = bound_streams(
@@ -119,12 +117,10 @@ async def collect_bash_output_snapshot(
     agent_url: str,
     session_key: str,
     command_id: str,
+    *,
+    require_exit_code: bool = True,
 ) -> RunLogSnapshot | None:
-    """Paginate ``bash_events/search`` for ``command_id`` and build a snapshot.
-
-    Uses timestamp order for concatenation (not ``limit=1``). Copies only —
-    never deletes agent-server files. Returns None if exit_code is still None.
-    """
+    """Paginate bash_events/search for command_id and build a snapshot."""
     items: list[dict[str, Any]] = []
     page_id: str | None = None
     truncated_by_pagination = False
@@ -158,7 +154,9 @@ async def collect_bash_output_snapshot(
             truncated_by_pagination = True
 
     return snapshot_from_bash_outputs(
-        items, truncated_by_pagination=truncated_by_pagination
+        items,
+        truncated_by_pagination=truncated_by_pagination,
+        require_exit_code=require_exit_code,
     )
 
 
@@ -168,18 +166,37 @@ def snapshot_already_written(run: AutomationRun) -> bool:
 
 
 def apply_run_log_snapshot(run: AutomationRun, snapshot: RunLogSnapshot) -> bool:
-    """Copy snapshot onto ``run`` if no snapshot exists yet.
-
-    Idempotent: a non-null ``exit_code`` is never overwritten. Returns True
-    if the snapshot was applied.
-    """
+    """Copy snapshot onto run unless a non-null exit_code is already stored."""
     if snapshot_already_written(run):
         return False
-    run.exit_code = snapshot.exit_code
+    if snapshot.exit_code is not None:
+        run.exit_code = snapshot.exit_code
     run.stdout = snapshot.stdout
     run.stderr = snapshot.stderr
     run.logs_truncated = snapshot.logs_truncated
     return True
+
+
+def snapshot_with_fallback_exit_code(
+    snapshot: RunLogSnapshot | None,
+    fallback_exit_code: int,
+) -> RunLogSnapshot:
+    """Fill a missing bash exit_code from the SDK callback (0 or 1)."""
+    if snapshot is None:
+        return RunLogSnapshot(
+            exit_code=fallback_exit_code,
+            stdout="",
+            stderr="",
+            logs_truncated=False,
+        )
+    if snapshot.exit_code is None:
+        return RunLogSnapshot(
+            exit_code=fallback_exit_code,
+            stdout=snapshot.stdout,
+            stderr=snapshot.stderr,
+            logs_truncated=snapshot.logs_truncated,
+        )
+    return snapshot
 
 
 def snapshot_column_values(snapshot: RunLogSnapshot) -> dict[str, Any]:
@@ -217,13 +234,12 @@ def verification_from_snapshot(run: AutomationRun) -> VerificationResult | None:
     )
 
 
-async def fetch_run_log_snapshot_for_run(run: AutomationRun) -> RunLogSnapshot | None:
-    """Best-effort snapshot from the run's agent-server, if events still exist.
-
-    No-op when ``bash_command_id`` is missing or a snapshot is already stored.
-    Failures are swallowed so completion/watchdog can still mark the run.
-    Never logs snapshot contents.
-    """
+async def fetch_run_log_snapshot_for_run(
+    run: AutomationRun,
+    *,
+    require_exit_code: bool = True,
+) -> RunLogSnapshot | None:
+    """Best-effort snapshot from the run's agent-server. Failures are swallowed."""
     if not run.bash_command_id or snapshot_already_written(run):
         return None
 
@@ -241,6 +257,7 @@ async def fetch_run_log_snapshot_for_run(run: AutomationRun) -> RunLogSnapshot |
                     ctx.agent_url,
                     ctx.session_key,
                     run.bash_command_id,
+                    require_exit_code=require_exit_code,
                 )
 
             if not run.sandbox_id:
@@ -261,6 +278,7 @@ async def fetch_run_log_snapshot_for_run(run: AutomationRun) -> RunLogSnapshot |
                 agent_url,
                 session_key,
                 run.bash_command_id,
+                require_exit_code=require_exit_code,
             )
     except Exception as exc:
         logger.warning(

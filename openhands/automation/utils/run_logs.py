@@ -66,6 +66,34 @@ def _event_sort_key(event: dict[str, Any]) -> tuple[str, str]:
     )
 
 
+def _concat_events(
+    events: list[dict[str, Any]],
+    *,
+    cap_bytes: int,
+    truncated_by_pagination: bool,
+) -> tuple[str, str, bool, int | None]:
+    ordered = sorted(events, key=_event_sort_key)
+    stdout_parts: list[str] = []
+    stderr_parts: list[str] = []
+    exit_code: int | None = None
+    for event in ordered:
+        stdout_parts.append(event.get("stdout") or "")
+        stderr_parts.append(event.get("stderr") or "")
+        raw = event.get("exit_code")
+        if raw is None:
+            continue
+        try:
+            exit_code = int(raw)
+        except (TypeError, ValueError):
+            continue
+    stdout, stderr, cut = bound_streams(
+        "".join(stdout_parts),
+        "".join(stderr_parts),
+        cap_bytes=cap_bytes,
+    )
+    return stdout, stderr, cut or truncated_by_pagination, exit_code
+
+
 def snapshot_from_bash_outputs(
     events: list[dict[str, Any]],
     *,
@@ -75,40 +103,34 @@ def snapshot_from_bash_outputs(
 ) -> RunLogSnapshot | None:
     """Concat BashOutput chunks in timestamp order and bound each stream.
 
-    Last non-null exit_code wins. Default: None until an exit_code exists.
-    ``require_exit_code=False`` keeps streams while bash is still running.
+    Default: None until an exit_code exists. ``require_exit_code=False``
+    keeps only still-running (null-exit) chunks.
     """
     if not events:
         return None
 
-    ordered = sorted(events, key=_event_sort_key)
-    stdout_parts: list[str] = []
-    stderr_parts: list[str] = []
-    exit_code: int | None = None
-    for event in ordered:
-        stdout_parts.append(event.get("stdout") or "")
-        stderr_parts.append(event.get("stderr") or "")
-        event_exit = event.get("exit_code")
-        if event_exit is None:
-            continue
-        try:
-            exit_code = int(event_exit)
-        except (TypeError, ValueError):
-            continue
+    kwargs = dict(cap_bytes=cap_bytes, truncated_by_pagination=truncated_by_pagination)
+    if not require_exit_code:
+        running = [event for event in events if event.get("exit_code") is None]
+        if running:
+            stdout, stderr, truncated, _ = _concat_events(running, **kwargs)
+            if not stdout and not stderr:
+                return None
+            return RunLogSnapshot(
+                exit_code=None,
+                stdout=stdout,
+                stderr=stderr,
+                logs_truncated=truncated,
+            )
 
-    if exit_code is None and require_exit_code:
+    stdout, stderr, truncated, exit_code = _concat_events(events, **kwargs)
+    if exit_code is None:
         return None
-
-    stdout, stderr, truncated = bound_streams(
-        "".join(stdout_parts),
-        "".join(stderr_parts),
-        cap_bytes=cap_bytes,
-    )
     return RunLogSnapshot(
         exit_code=exit_code,
         stdout=stdout,
         stderr=stderr,
-        logs_truncated=truncated or truncated_by_pagination,
+        logs_truncated=truncated,
     )
 
 
@@ -180,15 +202,10 @@ def apply_run_log_snapshot(run: AutomationRun, snapshot: RunLogSnapshot) -> bool
 def snapshot_with_fallback_exit_code(
     snapshot: RunLogSnapshot | None,
     fallback_exit_code: int,
-) -> RunLogSnapshot:
-    """Fill a missing bash exit_code from the SDK callback (0 or 1)."""
+) -> RunLogSnapshot | None:
+    """Fill a missing bash exit_code from the callback. None stays None."""
     if snapshot is None:
-        return RunLogSnapshot(
-            exit_code=fallback_exit_code,
-            stdout="",
-            stderr="",
-            logs_truncated=False,
-        )
+        return None
     if snapshot.exit_code is None:
         return RunLogSnapshot(
             exit_code=fallback_exit_code,

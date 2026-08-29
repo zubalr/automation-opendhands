@@ -75,20 +75,43 @@ def test_snapshot_keeps_streams_when_exit_code_not_required():
     assert snapshot.stderr == "warn"
 
 
+def test_require_exit_code_false_keeps_only_null_exit_chunks():
+    """In-progress collect drops chunks that already have an exit_code."""
+    events = [
+        {
+            "id": "1",
+            "timestamp": "2026-08-29T12:00:01Z",
+            "stdout": "live",
+            "stderr": "e1",
+            "exit_code": None,
+        },
+        {
+            "id": "2",
+            "timestamp": "2026-08-29T12:00:02Z",
+            "stdout": "done",
+            "stderr": "e2",
+            "exit_code": 0,
+        },
+    ]
+    snapshot = snapshot_from_bash_outputs(events, require_exit_code=False)
+    assert snapshot is not None
+    assert snapshot.exit_code is None
+    assert snapshot.stdout == "live"
+    assert snapshot.stderr == "e1"
+
+
 def test_fallback_exit_code_uses_callback_when_bash_still_running():
-    """Callback 0/1 fills a missing bash exit_code."""
+    """Callback 0/1 fills a missing bash exit_code. A miss stays a miss."""
     partial = RunLogSnapshot(
         exit_code=None, stdout="partial", stderr="e", logs_truncated=False
     )
     filled = snapshot_with_fallback_exit_code(partial, 0)
+    assert filled is not None
     assert filled.exit_code == 0
     assert filled.stdout == "partial"
     assert filled.stderr == "e"
 
-    empty = snapshot_with_fallback_exit_code(None, 1)
-    assert empty.exit_code == 1
-    assert empty.stdout == ""
-    assert empty.stderr == ""
+    assert snapshot_with_fallback_exit_code(None, 1) is None
 
 
 def test_truncation_flag_and_tail_prefer_stderr():
@@ -204,6 +227,48 @@ async def test_collect_paginates_and_concats_chunks():
 
 
 @pytest.mark.asyncio
+async def test_collect_without_exit_code_keeps_only_null_exit_chunks():
+    """collect(..., require_exit_code=False) ignores the finished chunk."""
+    page = {
+        "items": [
+            {
+                "id": "1",
+                "timestamp": "2026-08-29T12:00:01Z",
+                "stdout": "live",
+                "stderr": "",
+                "exit_code": None,
+            },
+            {
+                "id": "2",
+                "timestamp": "2026-08-29T12:00:02Z",
+                "stdout": "done",
+                "stderr": "err",
+                "exit_code": 0,
+            },
+        ],
+        "next_page_id": None,
+    }
+    mock_client = MagicMock(spec=httpx.AsyncClient)
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    resp.json.return_value = page
+    mock_client.get = AsyncMock(return_value=resp)
+
+    snapshot = await collect_bash_output_snapshot(
+        mock_client,
+        "http://agent",
+        "session-key",
+        "cmd-1",
+        require_exit_code=False,
+    )
+
+    assert snapshot is not None
+    assert snapshot.exit_code is None
+    assert snapshot.stdout == "live"
+    assert snapshot.stderr == ""
+
+
+@pytest.mark.asyncio
 async def test_get_run_logs_returns_stored_snapshot(async_client, async_session):
     """GET /v1/runs/{id}/logs returns the durable snapshot columns."""
     import uuid
@@ -305,8 +370,24 @@ async def test_complete_run_persists_logs_before_bash_exits(
     data = response.json()
     assert data["status"] == "COMPLETED"
     assert data["exit_code"] == 0
-    assert data["stdout"] == "partial-out"
-    assert data["stderr"] == "partial-err"
+    assert "stdout" not in data
+    assert "stderr" not in data
+
+    logs = await async_client.get(f"/api/automation/v1/runs/{run.id}/logs")
+    assert logs.status_code == 200
+    assert logs.json() == {
+        "exit_code": 0,
+        "stdout": "partial-out",
+        "stderr": "partial-err",
+        "logs_truncated": False,
+    }
+
+    listed = await async_client.get(f"/api/automation/v1/{automation.id}/runs")
+    assert listed.status_code == 200
+    listed_run = listed.json()["runs"][0]
+    assert "stdout" not in listed_run
+    assert "stderr" not in listed_run
+    assert listed_run["exit_code"] == 0
 
     await async_session.refresh(run)
     assert run.exit_code == 0
@@ -315,10 +396,10 @@ async def test_complete_run_persists_logs_before_bash_exits(
 
 
 @pytest.mark.asyncio
-async def test_complete_run_failed_fallback_exit_code_when_events_gone(
+async def test_complete_run_does_not_lock_empty_snapshot_when_fetch_misses(
     async_client, async_session
 ):
-    """Callback FAILED still stores exit_code=1 when events are gone."""
+    """A miss must not write empty logs + synthetic exit_code, then delete."""
     import uuid
 
     from openhands.automation.models import (
@@ -336,6 +417,7 @@ async def test_complete_run_failed_fallback_exit_code_when_events_gone(
         trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
         tarball_path="s3://bucket/code.tar.gz",
         entrypoint="uv run script.py",
+        keep_alive=False,
     )
     async_session.add(automation)
     await async_session.commit()
@@ -344,26 +426,34 @@ async def test_complete_run_failed_fallback_exit_code_when_events_gone(
         automation_id=automation.id,
         status=AutomationRunStatus.RUNNING,
         bash_command_id="cmd-pruned",
+        sandbox_id="sb-still-live",
     )
     async_session.add(run)
     await async_session.commit()
 
-    with patch(
-        "openhands.automation.router.fetch_run_log_snapshot_for_run",
-        new_callable=AsyncMock,
-        return_value=None,
+    with (
+        patch(
+            "openhands.automation.router.fetch_run_log_snapshot_for_run",
+            new_callable=AsyncMock,
+            return_value=None,
+        ),
+        patch("openhands.automation.router.cleanup_sandbox", new_callable=AsyncMock) as mock_cleanup,
     ):
         response = await async_client.post(
             f"/api/automation/v1/runs/{run.id}/complete",
             json={"status": "FAILED", "error": "entrypoint crashed"},
         )
+        mock_cleanup.assert_not_called()
 
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "FAILED"
-    assert data["exit_code"] == 1
+    assert data["exit_code"] is None
+    assert "stdout" not in data
+    assert "stderr" not in data
 
     await async_session.refresh(run)
-    assert run.exit_code == 1
-    assert run.stdout == ""
-    assert run.stderr == ""
+    assert run.exit_code is None
+    assert run.stdout is None
+    assert run.stderr is None
+    assert run.sandbox_id == "sb-still-live"

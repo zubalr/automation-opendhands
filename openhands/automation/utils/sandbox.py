@@ -7,7 +7,10 @@ For Cloud mode only — uses sandbox discovery to find agent server URL.
 For local mode, use utils/agent_server.py directly.
 """
 
+from __future__ import annotations
+
 import logging
+from typing import TYPE_CHECKING
 
 import httpx
 
@@ -22,6 +25,10 @@ from openhands.automation.utils.transient import (
     TransientErrorInfo,
     classify_httpx_transient_error,
 )
+
+
+if TYPE_CHECKING:
+    from openhands.automation.models import AutomationRun
 
 
 # Re-export for backward compatibility
@@ -178,12 +185,17 @@ async def verify_run_status(
     sandbox_id: str,
     run_id: str | None = None,
     bash_command_id: str | None = None,
+    run: AutomationRun | None = None,
 ) -> VerificationResult:
     """Verify an automation run's status by querying its sandbox.
 
     Connects to the sandbox, queries the last bash command's exit code,
     without deleting the sandbox. Cleanup is handled by callers according to
     the automation's sandbox cleanup policy.
+
+    If ``run`` already has a stored ``exit_code`` snapshot, that is returned
+    without polling live bash_events. After a live hit with a non-null
+    exit_code, a bounded concatenated snapshot is written onto ``run``.
 
     Args:
         api_url: OpenHands API URL
@@ -195,12 +207,29 @@ async def verify_run_status(
             In cloud mode each run owns its sandbox so contamination is
             unlikely, but scoping is still safer when the agent inside
             the sandbox runs other bash commands during the run.
+        run: Optional AutomationRun row used to read/write the log snapshot.
 
     Returns:
         VerificationResult with the verification outcome
     """
+    from openhands.automation.utils.run_logs import (
+        apply_run_log_snapshot,
+        collect_bash_output_snapshot,
+        verification_from_snapshot,
+    )
+
     api_url = api_url.rstrip("/")
     extra = log_extra(run_id=run_id, sandbox_id=sandbox_id)
+
+    if run is not None:
+        stored = verification_from_snapshot(run)
+        if stored is not None:
+            logger.info(
+                "Verified run status from stored snapshot: exit_code=%s",
+                stored.exit_code,
+                extra=extra,
+            )
+            return stored
 
     async with httpx.AsyncClient(timeout=60.0) as client:
         # Get sandbox agent URL
@@ -259,10 +288,35 @@ async def verify_run_status(
                 detail="Command still running",
             )
 
-        success = bash_result.exit_code == 0
+        snapshot = None
+        if bash_command_id:
+            try:
+                snapshot = await collect_bash_output_snapshot(
+                    client, agent_url, session_key, bash_command_id
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to collect bash log snapshot: %s", e, extra=extra
+                )
+
+        if snapshot is not None:
+            exit_code = snapshot.exit_code
+            stdout = snapshot.stdout
+            stderr = snapshot.stderr
+            logs_truncated = snapshot.logs_truncated
+        else:
+            exit_code = bash_result.exit_code
+            stdout = bash_result.stdout
+            stderr = bash_result.stderr
+            logs_truncated = False
+
+        if run is not None and snapshot is not None:
+            apply_run_log_snapshot(run, snapshot)
+
+        success = exit_code == 0
         logger.info(
             "Verified run status: exit_code=%s, success=%s",
-            bash_result.exit_code,
+            exit_code,
             success,
             extra=extra,
         )
@@ -271,7 +325,8 @@ async def verify_run_status(
             outcome=VerificationOutcome.COMPLETED
             if success
             else VerificationOutcome.FAILED,
-            exit_code=bash_result.exit_code,
-            stdout=bash_result.stdout,
-            stderr=bash_result.stderr,
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            logs_truncated=logs_truncated,
         )

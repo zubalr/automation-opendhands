@@ -243,6 +243,7 @@ class TestLocalAgentServerBackend:
                 session_key="local-key",
                 run_id="run-123",
                 bash_command_id="abc123def456",
+                run=mock_run,
             )
 
     @pytest.mark.asyncio
@@ -388,6 +389,7 @@ class TestCloudSandboxBackend:
                 sandbox_id="sandbox-123",
                 run_id="run-123",
                 bash_command_id="deadbeefcafebabe",
+                run=mock_run,
             )
 
     @pytest.mark.asyncio

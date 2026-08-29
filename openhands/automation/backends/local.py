@@ -179,6 +179,7 @@ class LocalAgentServerBackend(ExecutionBackend):
             session_key=self.api_key,
             run_id=run_id,
             bash_command_id=self._run.bash_command_id,
+            run=self._run,
         )
 
     async def cleanup_after_verification(

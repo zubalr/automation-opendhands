@@ -356,6 +356,66 @@ class TestVerifyRunOnAgentServer:
         assert result.exit_code == 1
         assert result.stderr == "Error"
 
+    @pytest.mark.asyncio
+    async def test_uses_stored_snapshot_when_bash_events_empty(self):
+        """Empty bash_events after snapshot still verifies via stored exit_code."""
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        run = SimpleNamespace(
+            exit_code=0,
+            stdout="stored stdout",
+            stderr="stored stderr",
+            logs_truncated=False,
+        )
+
+        with patch(
+            "openhands.automation.utils.agent_server.get_last_bash_command_result"
+        ) as mock_get:
+            result = await verify_run_on_agent_server(
+                agent_url="http://localhost:3000",
+                session_key="test-key",
+                run_id="run-123",
+                run=run,
+            )
+
+        mock_get.assert_not_called()
+        assert result.outcome == VerificationOutcome.COMPLETED
+        assert result.verified is True
+        assert result.success is True
+        assert result.exit_code == 0
+        assert result.stdout == "stored stdout"
+        assert result.stderr == "stored stderr"
+
+    @pytest.mark.asyncio
+    async def test_empty_events_without_snapshot_still_running(self):
+        """No bash output found without a snapshot remains STILL_RUNNING."""
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        run = SimpleNamespace(
+            exit_code=None,
+            stdout=None,
+            stderr=None,
+            logs_truncated=None,
+        )
+        mock_result = BashCommandResult(found=False, error="No bash output found")
+
+        with patch(
+            "openhands.automation.utils.agent_server.get_last_bash_command_result"
+        ) as mock_get:
+            mock_get.return_value = mock_result
+            result = await verify_run_on_agent_server(
+                agent_url="http://localhost:3000",
+                session_key="test-key",
+                run_id="run-123",
+                run=run,
+            )
+
+        assert result.outcome == VerificationOutcome.STILL_RUNNING
+        assert result.error == "No bash output found"
+        assert result.verified is False
+
 
 class TestDispatcherLocalMode:
     """Tests for dispatcher local mode behavior."""

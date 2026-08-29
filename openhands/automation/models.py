@@ -8,6 +8,7 @@ from typing import Any
 from sqlalchemy import (
     JSON,
     BigInteger,
+    Boolean,
     DateTime,
     Enum,
     Float,
@@ -206,6 +207,14 @@ class AutomationRun(Base):
     # shared agent server (e.g., the agent's TerminalTool or other runs in
     # local mode). Set immediately after `_start_bash` returns.
     bash_command_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # Durable snapshot of the outer bash command, written at first non-null
+    # exit_code. Live bash_events stay the streaming source while RUNNING;
+    # after prune/clear, verification and run-logs read these columns.
+    exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    stdout: Mapped[str | None] = mapped_column(Text, nullable=True)
+    stderr: Mapped[str | None] = mapped_column(Text, nullable=True)
+    logs_truncated: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
 
     # Event payload for event-triggered runs (JSON)
     # Contains the webhook payload that triggered this run.

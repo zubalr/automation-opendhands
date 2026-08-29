@@ -5,8 +5,11 @@ automation run status. These functions work with both Cloud sandboxes and
 local agent servers.
 """
 
+from __future__ import annotations
+
 import logging
 from enum import StrEnum
+from typing import TYPE_CHECKING
 
 import httpx
 from pydantic.dataclasses import dataclass
@@ -16,6 +19,10 @@ from openhands.automation.utils.transient import (
     TransientErrorInfo,
     classify_httpx_transient_error,
 )
+
+
+if TYPE_CHECKING:
+    from openhands.automation.models import AutomationRun
 
 
 logger = logging.getLogger(__name__)
@@ -142,6 +149,7 @@ class VerificationResult:
     exit_code: int | None = None
     stdout: str = ""
     stderr: str = ""
+    logs_truncated: bool = False
     error: str | None = None
     transient: bool = False
     outcome: VerificationOutcome | None = None
@@ -207,6 +215,7 @@ async def verify_run_on_agent_server(
     session_key: str,
     run_id: str | None = None,
     bash_command_id: str | None = None,
+    run: AutomationRun | None = None,
 ) -> VerificationResult:
     """Verify an automation run's status by querying an agent server directly.
 
@@ -216,6 +225,11 @@ async def verify_run_on_agent_server(
     Use this for local mode where the agent server is persistent and we don't
     need to discover the sandbox first.
 
+    If ``run`` already has a stored ``exit_code`` snapshot, that is returned
+    without polling live bash_events (which may have been pruned). After a
+    live hit with a non-null exit_code, a bounded concatenated snapshot is
+    written onto ``run`` (idempotent; never overwrites a non-null snapshot).
+
     Args:
         agent_url: Agent server URL
         session_key: API key for the agent server
@@ -224,12 +238,29 @@ async def verify_run_on_agent_server(
             run; when present, BashOutput lookups are scoped to it so the
             verifier doesn't sample an unrelated command's output from a
             shared agent server.
+        run: Optional AutomationRun row used to read/write the log snapshot.
 
     Returns:
         VerificationResult with the verification outcome
     """
+    from openhands.automation.utils.run_logs import (
+        apply_run_log_snapshot,
+        collect_bash_output_snapshot,
+        verification_from_snapshot,
+    )
+
     agent_url = agent_url.rstrip("/")
     extra = log_extra(run_id=run_id)
+
+    if run is not None:
+        stored = verification_from_snapshot(run)
+        if stored is not None:
+            logger.info(
+                "Verified run status from stored snapshot: exit_code=%s",
+                stored.exit_code,
+                extra=extra,
+            )
+            return stored
 
     async with httpx.AsyncClient(timeout=60.0) as client:
         # Get last bash command result, scoped to this run's command if known
@@ -263,10 +294,35 @@ async def verify_run_on_agent_server(
                 detail="Command still running",
             )
 
-        success = bash_result.exit_code == 0
+        snapshot = None
+        if bash_command_id:
+            try:
+                snapshot = await collect_bash_output_snapshot(
+                    client, agent_url, session_key, bash_command_id
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to collect bash log snapshot: %s", e, extra=extra
+                )
+
+        if snapshot is not None:
+            exit_code = snapshot.exit_code
+            stdout = snapshot.stdout
+            stderr = snapshot.stderr
+            logs_truncated = snapshot.logs_truncated
+        else:
+            exit_code = bash_result.exit_code
+            stdout = bash_result.stdout
+            stderr = bash_result.stderr
+            logs_truncated = False
+
+        if run is not None and snapshot is not None:
+            apply_run_log_snapshot(run, snapshot)
+
+        success = exit_code == 0
         logger.info(
             "Verified run status: exit_code=%s, success=%s",
-            bash_result.exit_code,
+            exit_code,
             success,
             extra=extra,
         )
@@ -275,7 +331,8 @@ async def verify_run_on_agent_server(
             outcome=VerificationOutcome.COMPLETED
             if success
             else VerificationOutcome.FAILED,
-            exit_code=bash_result.exit_code,
-            stdout=bash_result.stdout,
-            stderr=bash_result.stderr,
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            logs_truncated=logs_truncated,
         )

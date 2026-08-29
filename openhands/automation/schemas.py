@@ -811,12 +811,25 @@ class AutomationRunResponse(BaseModel):
     timeout_at: UtcDatetime | None
     sandbox_id: str | None
     bash_command_id: str | None = None
+    exit_code: int | None = None
+    stdout: str | None = None
+    stderr: str | None = None
+    logs_truncated: bool | None = None
     run_metadata: dict[str, Any] | None = None
     created_at: UtcDatetime
     started_at: UtcDatetime | None
     completed_at: UtcDatetime | None
 
     model_config = {"from_attributes": True}
+
+
+class AutomationRunLogsResponse(BaseModel):
+    """Durable snapshot of a run's outer bash command logs."""
+
+    exit_code: int | None = None
+    stdout: str | None = None
+    stderr: str | None = None
+    logs_truncated: bool | None = None
 
 
 class AutomationRunListResponse(BaseModel):

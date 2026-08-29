@@ -110,6 +110,41 @@ class TestVerifyAndMarkRunExitCodes:
             assert run.error_detail is None
 
     @pytest.mark.asyncio
+    async def test_completed_writes_log_snapshot_columns(
+        self, async_session_factory, automation_with_run, mock_settings
+    ):
+        """Watchdog COMPLETED persists exit_code/stdout/stderr/logs_truncated."""
+        run_id = automation_with_run["run_id"]
+
+        verification = VerificationResult(
+            verified=True,
+            success=True,
+            exit_code=0,
+            stdout="chunk-a chunk-b",
+            stderr="warn",
+            logs_truncated=False,
+        )
+
+        mock_backend = _create_mock_backend(verification)
+        with patch(
+            "openhands.automation.watchdog.get_backend", return_value=mock_backend
+        ):
+            async with async_session_factory() as session:
+                run = await session.get(AutomationRun, run_id)
+                result = await _verify_and_mark_run(session, run, mock_settings)
+                await session.commit()
+
+        assert result is True
+
+        async with async_session_factory() as session:
+            run = await session.get(AutomationRun, run_id)
+            assert run.status == AutomationRunStatus.COMPLETED
+            assert run.exit_code == 0
+            assert run.stdout == "chunk-a chunk-b"
+            assert run.stderr == "warn"
+            assert run.logs_truncated is False
+
+    @pytest.mark.asyncio
     async def test_exit_code_0_keep_alive_true_skips_cleanup(
         self, async_session_factory, automation_with_run, mock_settings
     ):

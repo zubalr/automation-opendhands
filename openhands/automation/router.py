@@ -37,6 +37,7 @@ from openhands.automation.schemas import (
     AutomationListResponse,
     AutomationResponse,
     AutomationRunListResponse,
+    AutomationRunLogsResponse,
     AutomationRunResponse,
     CreateAutomationRequest,
     RunCompleteRequest,
@@ -62,6 +63,10 @@ from openhands.automation.utils.run import (
     create_pending_run,
     record_first_run_outcome,
     skip_pending_runs_for_disabled_automation,
+)
+from openhands.automation.utils.run_logs import (
+    fetch_run_log_snapshot_for_run,
+    snapshot_values_for_run,
 )
 from openhands.automation.utils.run_status_detail import (
     run_status_detail_from_callback_error,
@@ -551,6 +556,11 @@ async def complete_run(
         "status": new_status,
         "completed_at": now,
     }
+    # Snapshot final bash output while events still exist. Best-effort:
+    # completion still lands if the agent-server is already gone.
+    if run.bash_command_id and run.exit_code is None:
+        snapshot = await fetch_run_log_snapshot_for_run(run)
+        values.update(snapshot_values_for_run(run, snapshot))
     if body.conversation_id:
         values["conversation_id"] = body.conversation_id
     if body.cost is not None:
@@ -684,6 +694,39 @@ async def complete_run(
             )
 
     return AutomationRunResponse.model_validate(run)
+
+
+@router.get("/runs/{run_id}/logs")
+async def get_run_logs(
+    run_id: uuid.UUID,
+    user: AuthenticatedUser = Depends(_require_manage_automations),
+    session: AsyncSession = Depends(get_session),
+) -> AutomationRunLogsResponse:
+    """Return the durable bash log snapshot for a run.
+
+    Live bash_events remain the streaming source while RUNNING. After a
+    snapshot is written, this endpoint serves the stored copy so prune or
+    sandbox teardown cannot empty the run-logs UI.
+    """
+    result = await session.execute(
+        select(AutomationRun)
+        .where(AutomationRun.id == run_id)
+        .options(selectinload(AutomationRun.automation))
+    )
+    run = result.scalars().first()
+    if run is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Run not found")
+
+    automation = run.automation
+    if automation.org_id != user.org_id:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Not your automation")
+
+    return AutomationRunLogsResponse(
+        exit_code=run.exit_code,
+        stdout=run.stdout,
+        stderr=run.stderr,
+        logs_truncated=run.logs_truncated,
+    )
 
 
 # --- Run phase reporting ---

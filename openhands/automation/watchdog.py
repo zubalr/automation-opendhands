@@ -170,6 +170,7 @@ async def _verify_and_mark_run(
 
     # Get backend for this run (mode-specific logic encapsulated)
     backend = get_backend(run)
+    had_persisted_snapshot = run.exit_code is not None
 
     # Verify run status via backend
     try:
@@ -218,6 +219,14 @@ async def _verify_and_mark_run(
         VerificationOutcome.FAILED,
     ):
         exit_code = verification.exit_code
+        snapshot_vals: dict = {}
+        if not had_persisted_snapshot and exit_code is not None:
+            snapshot_vals = {
+                "exit_code": exit_code,
+                "stdout": verification.stdout or "",
+                "stderr": verification.stderr or "",
+                "logs_truncated": bool(verification.logs_truncated),
+            }
 
         # Command completed successfully; the callback was missed.
         if verification.outcome == VerificationOutcome.COMPLETED:
@@ -237,6 +246,7 @@ async def _verify_and_mark_run(
                     status=AutomationRunStatus.COMPLETED,
                     completed_at=now,
                     status_detail=None,
+                    **snapshot_vals,
                 )
             )
 
@@ -273,6 +283,7 @@ async def _verify_and_mark_run(
                         previous=run.status_detail,
                         extra={"formatted_detail": error_detail},
                     ),
+                    **snapshot_vals,
                 )
             )
 
@@ -310,6 +321,7 @@ async def _verify_and_mark_run(
                         code=str(exit_code),
                         previous=run.status_detail,
                     ),
+                    **snapshot_vals,
                 )
             )
 

@@ -67,6 +67,7 @@ from openhands.automation.utils.run import (
 from openhands.automation.utils.run_logs import (
     fetch_run_log_snapshot_for_run,
     snapshot_values_for_run,
+    snapshot_with_fallback_exit_code,
 )
 from openhands.automation.utils.run_status_detail import (
     run_status_detail_from_callback_error,
@@ -556,11 +557,22 @@ async def complete_run(
         "status": new_status,
         "completed_at": now,
     }
-    # Snapshot final bash output while events still exist. Best-effort:
-    # completion still lands if the agent-server is already gone.
+    # Snapshot bash output while events still exist. The SDK callback
+    # fires from workspace __exit__ *inside* the outer bash command, so
+    # exit_code is often still null — keep the streams anyway and fall
+    # back to the callback status (0/1). Best-effort: completion still
+    # lands if the agent-server is already gone.
     if run.bash_command_id and run.exit_code is None:
-        snapshot = await fetch_run_log_snapshot_for_run(run)
-        values.update(snapshot_values_for_run(run, snapshot))
+        snapshot = await fetch_run_log_snapshot_for_run(run, require_exit_code=False)
+        values.update(
+            snapshot_values_for_run(
+                run,
+                snapshot_with_fallback_exit_code(
+                    snapshot,
+                    0 if body.status == "COMPLETED" else 1,
+                ),
+            )
+        )
     if body.conversation_id:
         values["conversation_id"] = body.conversation_id
     if body.cost is not None:

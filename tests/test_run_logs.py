@@ -13,6 +13,7 @@ from openhands.automation.utils.run_logs import (
     collect_bash_output_snapshot,
     snapshot_from_bash_outputs,
     snapshot_values_for_run,
+    snapshot_with_fallback_exit_code,
 )
 
 
@@ -57,6 +58,39 @@ def test_snapshot_none_until_exit_code_present():
     assert snapshot_from_bash_outputs(events) is None
 
 
+def test_snapshot_keeps_streams_when_exit_code_not_required():
+    """Callback-time collect must keep stdout/stderr before bash exits."""
+    events = [
+        {
+            "timestamp": "2026-08-29T12:00:01Z",
+            "stdout": "still running",
+            "stderr": "warn",
+            "exit_code": None,
+        }
+    ]
+    snapshot = snapshot_from_bash_outputs(events, require_exit_code=False)
+    assert snapshot is not None
+    assert snapshot.exit_code is None
+    assert snapshot.stdout == "still running"
+    assert snapshot.stderr == "warn"
+
+
+def test_fallback_exit_code_uses_callback_when_bash_still_running():
+    """Workspace __exit__ POSTs complete before the outer command exits."""
+    partial = RunLogSnapshot(
+        exit_code=None, stdout="partial", stderr="e", logs_truncated=False
+    )
+    filled = snapshot_with_fallback_exit_code(partial, 0)
+    assert filled.exit_code == 0
+    assert filled.stdout == "partial"
+    assert filled.stderr == "e"
+
+    empty = snapshot_with_fallback_exit_code(None, 1)
+    assert empty.exit_code == 1
+    assert empty.stdout == ""
+    assert empty.stderr == ""
+
+
 def test_truncation_flag_and_tail_prefer_stderr():
     """Streams over the cap keep the tail; logs_truncated is set if either is cut."""
     cap = 16
@@ -85,6 +119,15 @@ def test_truncation_flag_and_tail_prefer_stderr():
 
 def test_default_cap_is_256_kib():
     assert SNAPSHOT_STREAM_CAP_BYTES == 256 * 1024
+
+
+def test_string_exit_code_is_coerced_to_int():
+    snapshot = snapshot_from_bash_outputs(
+        [{"timestamp": "2026-08-29T12:00:01Z", "stdout": "x", "exit_code": "0"}]
+    )
+    assert snapshot is not None
+    assert snapshot.exit_code == 0
+    assert isinstance(snapshot.exit_code, int)
 
 
 def test_apply_snapshot_is_idempotent():
@@ -266,3 +309,123 @@ async def test_complete_run_persists_snapshot_when_events_exist(
     assert run.stdout == "concat-out"
     assert run.stderr == "concat-err"
     assert run.logs_truncated is False
+
+
+@pytest.mark.asyncio
+async def test_complete_run_persists_logs_before_bash_exits(
+    async_client, async_session
+):
+    """SDK callback is inside the outer bash command; persist streams anyway."""
+    import uuid
+
+    from openhands.automation.models import (
+        Automation,
+        AutomationRun,
+        AutomationRunStatus,
+    )
+
+    user_id = uuid.UUID("12345678-1234-5678-1234-567812345678")
+    org_id = uuid.UUID("87654321-4321-8765-4321-876543218765")
+    automation = Automation(
+        user_id=user_id,
+        org_id=org_id,
+        name="Callback Before Exit",
+        trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+        tarball_path="s3://bucket/code.tar.gz",
+        entrypoint="uv run script.py",
+    )
+    async_session.add(automation)
+    await async_session.commit()
+
+    run = AutomationRun(
+        automation_id=automation.id,
+        status=AutomationRunStatus.RUNNING,
+        bash_command_id="cmd-still-running",
+    )
+    async_session.add(run)
+    await async_session.commit()
+
+    snapshot = RunLogSnapshot(
+        exit_code=None,
+        stdout="partial-out",
+        stderr="partial-err",
+        logs_truncated=False,
+    )
+    with patch(
+        "openhands.automation.router.fetch_run_log_snapshot_for_run",
+        new_callable=AsyncMock,
+        return_value=snapshot,
+    ) as mock_fetch:
+        response = await async_client.post(
+            f"/api/automation/v1/runs/{run.id}/complete",
+            json={"status": "COMPLETED"},
+        )
+        mock_fetch.assert_awaited()
+        assert mock_fetch.await_args.kwargs.get("require_exit_code") is False
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "COMPLETED"
+    assert data["exit_code"] == 0
+    assert data["stdout"] == "partial-out"
+    assert data["stderr"] == "partial-err"
+
+    await async_session.refresh(run)
+    assert run.exit_code == 0
+    assert run.stdout == "partial-out"
+    assert run.stderr == "partial-err"
+
+
+@pytest.mark.asyncio
+async def test_complete_run_failed_fallback_exit_code_when_events_gone(
+    async_client, async_session
+):
+    """If bash events are already gone, still persist callback pass/fail."""
+    import uuid
+
+    from openhands.automation.models import (
+        Automation,
+        AutomationRun,
+        AutomationRunStatus,
+    )
+
+    user_id = uuid.UUID("12345678-1234-5678-1234-567812345678")
+    org_id = uuid.UUID("87654321-4321-8765-4321-876543218765")
+    automation = Automation(
+        user_id=user_id,
+        org_id=org_id,
+        name="Callback No Events",
+        trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+        tarball_path="s3://bucket/code.tar.gz",
+        entrypoint="uv run script.py",
+    )
+    async_session.add(automation)
+    await async_session.commit()
+
+    run = AutomationRun(
+        automation_id=automation.id,
+        status=AutomationRunStatus.RUNNING,
+        bash_command_id="cmd-pruned",
+    )
+    async_session.add(run)
+    await async_session.commit()
+
+    with patch(
+        "openhands.automation.router.fetch_run_log_snapshot_for_run",
+        new_callable=AsyncMock,
+        return_value=None,
+    ):
+        response = await async_client.post(
+            f"/api/automation/v1/runs/{run.id}/complete",
+            json={"status": "FAILED", "error": "entrypoint crashed"},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "FAILED"
+    assert data["exit_code"] == 1
+
+    await async_session.refresh(run)
+    assert run.exit_code == 1
+    assert run.stdout == ""
+    assert run.stderr == ""
